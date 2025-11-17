@@ -38,6 +38,7 @@ import ghidra.program.model.data.DataUtilities;
 import ghidra.program.model.data.FileDataTypeManager;
 import ghidra.program.model.data.FunctionDefinitionDataType;
 import ghidra.program.model.data.DataUtilities.ClearDataMode;
+import ghidra.program.model.data.ParameterDefinitionImpl;
 import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.VoidDataType;
 import ghidra.program.model.lang.Register;
@@ -162,30 +163,193 @@ public class AmigaHunkAnalyzer extends AbstractAnalyzer {
 
 		return true;
 	}
-	
-	private static DataType getAmigaDataType(String type, FileDataTypeManager fdm) {
-		DataType dataType = PointerDataType.dataType;
+
+	/**
+	 * Find the matching closing parenthesis for an opening parenthesis.
+	 * @param str The string to search
+	 * @param openPos The position of the opening parenthesis
+	 * @return The position of the matching closing parenthesis, or -1 if not found
+	 */
+	private static int findMatchingParen(String str, int openPos) {
+		int depth = 1;
+		for (int i = openPos + 1; i < str.length(); i++) {
+			if (str.charAt(i) == '(') {
+				depth++;
+			} else if (str.charAt(i) == ')') {
+				depth--;
+				if (depth == 0) {
+					return i;
+				}
+			}
+		}
+		return -1; // Unmatched
+	}
+
+	/**
+	 * Split a parameter list by commas, respecting nested parentheses.
+	 * @param paramList The parameter list string (e.g., "APTR, LONG (*)(APTR, APTR)")
+	 * @return Array of parameter type strings
+	 */
+	private static String[] splitParameters(String paramList) {
+		List<String> params = new ArrayList<>();
+		int depth = 0;
+		int start = 0;
+
+		for (int i = 0; i < paramList.length(); i++) {
+			char c = paramList.charAt(i);
+			if (c == '(') {
+				depth++;
+			} else if (c == ')') {
+				depth--;
+			} else if (c == ',' && depth == 0) {
+				params.add(paramList.substring(start, i).trim());
+				start = i + 1;
+			}
+		}
+		params.add(paramList.substring(start).trim());
+
+		return params.toArray(new String[0]);
+	}
+
+	/**
+	 * Parse a non-function type string into a Ghidra DataType.
+	 * Handles basic types, pointers, and struct types.
+	 * @param type The type string (e.g., "APTR", "struct Hook *", "LONG **")
+	 * @param fdm The data type manager
+	 * @return The corresponding DataType, or PointerDataType as fallback
+	 */
+	private static DataType parseNonFunctionType(String type, FileDataTypeManager fdm) {
+		// Remove qualifiers
 		type = type.replace("struct ", "");
 		type = type.replace("const ", "");
 		type = type.replace("CONST ", "");
 		type = type.replace("volatile ", "");
 		type = type.replace("VOLATILE ", "");
-		if(type.contains("("))
-			return new PointerDataType(new FunctionDefinitionDataType("FUNC")); // TODO: correct function pointer type
-		for(var word : type.split(" ")) {
-			if(word.equals("*")) {
-				dataType = new PointerDataType(dataType);
-			} else if(word.equals("**")) {
-				dataType = new PointerDataType(new PointerDataType(dataType));
+		type = type.trim();
+
+		if (type.isEmpty()) {
+			return PointerDataType.dataType;
+		}
+
+		DataType dataType = null;
+
+		// Split by whitespace (handles "LONG *" or "Node * *")
+		for (var word : type.split("\\s+")) {
+			if (word.isEmpty()) {
+				continue;
+			}
+
+			if (word.equals("*")) {
+				if (dataType == null) {
+					dataType = PointerDataType.dataType;
+				} else {
+					dataType = new PointerDataType(dataType);
+				}
+			} else if (word.equals("**")) {
+				if (dataType == null) {
+					dataType = new PointerDataType(PointerDataType.dataType);
+				} else {
+					dataType = new PointerDataType(new PointerDataType(dataType));
+				}
 			} else {
 				var list = new ArrayList<DataType>();
 				fdm.findDataTypes(word, list);
 				dataType = !list.isEmpty() ? list.get(0) : null;
-				if(dataType == null)
+				if (dataType == null) {
 					System.out.println(word + " not found!");
+					return PointerDataType.dataType; // Fallback
+				}
 			}
 		}
-		return dataType;
+
+		return dataType != null ? dataType : PointerDataType.dataType;
+	}
+
+	/**
+	 * Parse a function pointer type string into a Ghidra DataType.
+	 * Handles syntax like: VOID (*)(struct Hook *, APTR, struct Message *)
+	 * @param type The function pointer type string
+	 * @param fdm The data type manager
+	 * @return A PointerDataType wrapping a FunctionDefinitionDataType, or null on parse failure
+	 */
+	private static DataType parseFunctionPointerType(String type, FileDataTypeManager fdm) {
+		// Find the function pointer pattern: (*)
+		int funcPtrStart = type.indexOf("(*");
+		if (funcPtrStart == -1) {
+			return null;
+		}
+
+		// Extract return type (everything before "(*")
+		String returnTypeStr = type.substring(0, funcPtrStart).trim();
+
+		// Find parameter list (after "(*)")
+		int paramListStart = type.indexOf('(', funcPtrStart + 2);
+		if (paramListStart == -1) {
+			return null; // Malformed
+		}
+
+		int paramListEnd = findMatchingParen(type, paramListStart);
+		if (paramListEnd == -1) {
+			return null; // Malformed
+		}
+
+		String paramListStr = type.substring(paramListStart + 1, paramListEnd).trim();
+
+		// Parse return type
+		DataType returnType = parseNonFunctionType(returnTypeStr, fdm);
+		if (returnType == null) {
+			returnType = VoidDataType.dataType;
+		}
+
+		// Create function definition
+		FunctionDefinitionDataType funcDef = new FunctionDefinitionDataType("func_ptr");
+		funcDef.setReturnType(returnType);
+
+		// Parse and set parameters
+		if (!paramListStr.isEmpty() && !paramListStr.equalsIgnoreCase("VOID")) {
+			String[] paramTypes = splitParameters(paramListStr);
+			ParameterDefinitionImpl[] params = new ParameterDefinitionImpl[paramTypes.length];
+
+			for (int i = 0; i < paramTypes.length; i++) {
+				DataType paramType = parseNonFunctionType(paramTypes[i].trim(), fdm);
+				if (paramType == null) {
+					paramType = PointerDataType.dataType;
+				}
+
+				params[i] = new ParameterDefinitionImpl(
+					"param" + i,  // name
+					paramType,    // type
+					null          // comment
+				);
+			}
+
+			funcDef.setArguments(params);
+		}
+
+		// Return function pointer (not function definition)
+		return new PointerDataType(funcDef);
+	}
+
+	/**
+	 * Parse a type string from SFD/FD files into a Ghidra DataType.
+	 * Handles regular types, pointers, and function pointers.
+	 * @param type The type string (e.g., "APTR", "struct Hook *", "VOID (*)(APTR, APTR)")
+	 * @param fdm The data type manager
+	 * @return The corresponding DataType
+	 */
+	private static DataType getAmigaDataType(String type, FileDataTypeManager fdm) {
+		// Check if it's a function pointer
+		if (type.contains("(*")) {
+			DataType funcPtrType = parseFunctionPointerType(type, fdm);
+			if (funcPtrType != null) {
+				return funcPtrType;
+			}
+			// Fallback to old behavior if parsing fails
+			return new PointerDataType(new FunctionDefinitionDataType("FUNC"));
+		}
+
+		// Handle regular types (non-function pointers)
+		return parseNonFunctionType(type, fdm);
 	}
 
 	private static void createFunctionsSegment(FlatProgramAPI fpa, FileDataTypeManager fdm, String lib, FdLibFunctions funcs, MessageLog log) throws InvalidInputException, DuplicateNameException, CodeUnitInsertionException {
